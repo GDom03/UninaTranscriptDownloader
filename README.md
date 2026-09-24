@@ -16,47 +16,67 @@ Scarica la trascrizione di una lezione registrata su **Microsoft Stream / ShareP
 
 ## Installazione
 
+Servono Python 3.9 o superiore. Crea ambiente e installa dipendenze.
+
+### Windows (PowerShell)
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+### Linux
+
 ```bash
-pip install -r requirements.txt
-playwright install chromium
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
+```
+
+Su Ubuntu/Debian, se Chromium segnala librerie di sistema mancanti:
+
+```bash
+.venv/bin/python -m playwright install --with-deps chromium
 ```
 
 ---
 
 ## Configurazione
 
-Crea il file `.env` a partire dall'esempio:
-
-```bash
-cp .env.example .env
-```
-
-Modifica `.env`:
+Crea un file `.env` nella cartella del progetto:
 
 ```env
 STREAM_URL="https://tuo-istituto.sharepoint.com/sites/.../stream.aspx?id=..."
 
-# Opzionale: login automatico
+# Facoltativi: login automatico
 MICROSOFT_EMAIL="tua@email.it"
-MICROSOFT_PASSWORD="tuapassword"
+MICROSOFT_PASSWORD="tua password"
 ```
+
+Lo script carica `.env` dalla propria cartella. In alternativa, passa l'URL con `--url`.
+
+Durante l'accesso, completa eventuali verifiche richieste dall'istituto. Inviti facoltativi con scelta esatta “Non ora”, “Salta per ora” o equivalenti inglesi vengono saltati automaticamente.
 
 ---
 
 ## Esecuzione
 
-```bash
-# Con venv attivo (consigliato)
-.venv/bin/python extract_stream_transcript.py
+Windows (PowerShell):
 
-# Oppure con argomenti da CLI (sovrascrivono .env)
-.venv/bin/python extract_stream_transcript.py \
-  --url "https://..." \
-  --out-dir "./output" \
-  --timeout-minutes 10
+```powershell
+.\.venv\Scripts\python.exe extract_stream_transcript.py --url "https://..." --out-dir ".\output" --timeout-minutes 10
 ```
 
-Al **primo avvio**, il browser si apre e chiede il login. Da quel momento la sessione è salvata e non verrà più richiesta.
+Linux:
+
+```bash
+.venv/bin/python extract_stream_transcript.py --url "https://..." --out-dir "./output" --timeout-minutes 10
+```
+
+Il browser si apre per il login iniziale; sessione salvata nel profilo `.pw-sharepoint-profile`. Su Linux, primo accesso richiede ambiente grafico. Non avviare due copie insieme: Chromium permette una sola istanza per profilo.
+
+Se l'API non è disponibile, lo script scorre il pannello della trascrizione. Se non riesce a visitare tutte le voci, segnala l'estrazione incompleta e non sovrascrive i file precedenti.
 
 **Output** (nella cartella corrente o in `--out-dir`):
 

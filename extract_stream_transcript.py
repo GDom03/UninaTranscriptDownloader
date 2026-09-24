@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import html
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass, asdict
@@ -45,7 +46,7 @@ import os
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Response, Page, BrowserContext
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 
 
 DEFAULT_URL = os.environ.get("STREAM_URL", "")
@@ -60,6 +61,7 @@ ISO_DURATION_RE = re.compile(
     r"(?:(?P<s>\d+(?:\.\d+)?)S)?$",
     re.I,
 )
+TIME_CODE_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:[.,]\d+)?)$")
 
 
 @dataclass
@@ -74,24 +76,44 @@ class Entry:
 
 
 def iso_to_seconds(value: Any) -> Optional[float]:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
 
     if isinstance(value, (int, float)):
-        return float(value)
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) else None
 
     if not isinstance(value, str):
         return None
 
-    m = ISO_DURATION_RE.match(value.strip())
-    if not m:
+    value = value.strip()
+    if not value:
         return None
 
-    return (
-        float(m.group("h") or 0) * 3600.0
-        + float(m.group("m") or 0) * 60.0
-        + float(m.group("s") or 0)
-    )
+    m = ISO_DURATION_RE.match(value)
+    if m:
+        return (
+            float(m.group("h") or 0) * 3600.0
+            + float(m.group("m") or 0) * 60.0
+            + float(m.group("s") or 0)
+        )
+
+    # Le API Stream restituiscono anche offset come "00:01:23.400";
+    # altre versioni usano secondi numerici serializzati come stringhe.
+    m = TIME_CODE_RE.match(value.replace(",", "."))
+    if m:
+        hours, minutes, seconds = m.groups()
+        return (
+            int(hours or 0) * 3600.0
+            + int(minutes) * 60.0
+            + float(seconds)
+        )
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) else None
 
 
 def seconds_to_timestamp(seconds: Optional[float]) -> str:
@@ -110,6 +132,42 @@ def clean_text(value: Any) -> str:
     text = str(value)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def safe_url(value: str) -> str:
+    """Rimuove query e frammento dai URL diagnostici, che possono contenere token."""
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return f"{parsed.scheme}://{host}{parsed.path}"
+
+
+def first_value(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def transcript_text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("text", "content", "value", "displayText"):
+            if key in value:
+                text = transcript_text(value[key])
+                if text:
+                    return text
+        return ""
+    if isinstance(value, list):
+        return clean_text(" ".join(transcript_text(part) for part in value))
+    return clean_text(value)
+
+
+def speaker_name(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        value = first_value(value, "displayName", "name", "speakerDisplayName", "id")
+    return clean_text(value) or None
 
 
 def normalize_transcript(
@@ -138,20 +196,25 @@ def normalize_transcript(
         if not isinstance(item, dict):
             continue
 
-        speaker = (
-            item.get("speakerDisplayName")
-            or item.get("speaker")
-            or item.get("speakerId")
-            or item.get("displayName")
+        speaker = speaker_name(
+            first_value(
+                item,
+                "speakerDisplayName",
+                "speakerName",
+                "speaker",
+                "speakerId",
+                "displayName",
+            )
         )
 
-        start_offset = item.get("startOffset")
-        end_offset = item.get("endOffset")
-
-        text_value = (
-            item.get("text")
-            if item.get("text") is not None
-            else item.get("content", "")
+        start_offset = first_value(
+            item, "startOffset", "startSeconds", "start_seconds", "startTime", "start"
+        )
+        end_offset = first_value(
+            item, "endOffset", "endSeconds", "end_seconds", "endTime", "end"
+        )
+        text_value = first_value(
+            item, "text", "content", "caption", "transcriptText", "displayText"
         )
 
         entries.append(
@@ -159,21 +222,17 @@ def normalize_transcript(
                 index=idx,
                 start_seconds=iso_to_seconds(start_offset),
                 end_seconds=iso_to_seconds(end_offset),
-                speaker=clean_text(speaker) or None,
-                text=clean_text(text_value),
-                start_offset=start_offset,
-                end_offset=end_offset,
+                speaker=speaker,
+                text=transcript_text(text_value),
+                start_offset=str(start_offset) if start_offset is not None else None,
+                end_offset=str(end_offset) if end_offset is not None else None,
             )
         )
 
-    # Alcune versioni/strutture possono avere entry non ordinate.
-    entries.sort(
-        key=lambda x: (
-            x.start_seconds is None,
-            x.start_seconds if x.start_seconds is not None else float("inf"),
-            x.index,
-        )
-    )
+    # Riordina solo se ogni voce ha un timestamp: con valori mancanti l'ordine
+    # originale dell'API contiene più informazione di un ordinamento parziale.
+    if entries and all(entry.start_seconds is not None for entry in entries):
+        entries.sort(key=lambda entry: (entry.start_seconds, entry.index))
 
     # Reindicizza.
     for i, entry in enumerate(entries):
@@ -183,8 +242,13 @@ def normalize_transcript(
     # Per l'ultima voce usa +2s come durata minima di visualizzazione.
     for i, entry in enumerate(entries):
         if entry.end_seconds is None:
-            next_start = (
-                entries[i + 1].start_seconds if i + 1 < len(entries) else None
+            next_start = next(
+                (
+                    following.start_seconds
+                    for following in entries[i + 1 :]
+                    if following.start_seconds is not None
+                ),
+                None,
             )
             if next_start is not None and entry.start_seconds is not None:
                 entry.end_seconds = max(
@@ -192,6 +256,11 @@ def normalize_transcript(
                 )
             elif entry.start_seconds is not None:
                 entry.end_seconds = entry.start_seconds + 2.0
+
+        if entry.start_seconds is not None and entry.start_offset is None:
+            entry.start_offset = seconds_to_timestamp(entry.start_seconds)
+        if entry.end_seconds is not None and entry.end_offset is None:
+            entry.end_offset = seconds_to_timestamp(entry.end_seconds)
 
     return {
         "format": "teams-transcript-normalized",
@@ -392,7 +461,10 @@ def parse_vtt_to_raw_json(vtt: str) -> dict[str, Any]:
     out: list[dict[str, Any]] = []
 
     def parse_ts(value: str) -> Optional[float]:
-        value = value.strip().split()[0]
+        parts = value.strip().split()
+        if not parts:
+            return None
+        value = parts[0].replace(",", ".")
         parts = value.split(":")
         try:
             if len(parts) == 3:
@@ -445,7 +517,7 @@ def parse_vtt_to_raw_json(vtt: str) -> dict[str, Any]:
     return {"entries": out, "sourceFormat": "webvtt"}
 
 
-async def collect_virtualized_dom_transcript(page: Page) -> list[dict[str, Any]]:
+async def collect_virtualized_dom_transcript(page: Page) -> dict[str, Any]:
     """
     Fallback: Stream mostra una lista virtualizzata. Scorriamo lo scroller
     e raccogliamo gli elementi già montati nel DOM, identificandoli tramite
@@ -468,30 +540,46 @@ async def collect_virtualized_dom_transcript(page: Page) -> list[dict[str, Any]]
                    el.scrollHeight > el.clientHeight + 20;
           }
 
-          let scroller = firstEntry;
-          while (scroller && scroller.parentElement) {
-            if (isScrollable(scroller)) break;
-            scroller = scroller.parentElement;
+          // Stream/Fluent UI marca lo scroller reale con data-is-scrollable.
+          // Il solo overflowY varia tra Windows e Linux.
+          let scroller = firstEntry.closest('[data-is-scrollable="true"]');
+          if (!scroller) {
+            let parent = firstEntry;
+            while (parent && parent !== root.parentElement) {
+              if (isScrollable(parent)) {
+                scroller = parent;
+                break;
+              }
+              parent = parent.parentElement;
+            }
           }
-
-          if (!scroller || !isScrollable(scroller)) {
-            scroller = root;
+          if (!scroller) {
+            throw new Error("Scroller del transcript non trovato nel DOM.");
           }
 
           const found = new Map();
+          const observedPositions = new Set();
+          let expectedCount = null;
 
           function collectVisible() {
             root.querySelectorAll("[aria-posinset]").forEach(el => {
-              const textEl = el.querySelector("[class*='entryText']") || el;
-              if (!textEl) return;
+              const pos = el.getAttribute("aria-posinset") || "";
+              const posNumber = Number(pos);
+              if (Number.isInteger(posNumber) && posNumber > 0) {
+                observedPositions.add(posNumber);
+              }
+              const setSize = Number(el.getAttribute("aria-setsize"));
+              if (Number.isInteger(setSize) && setSize > 0) {
+                expectedCount = Math.max(expectedCount || 0, setSize);
+              }
 
+              // eventText indica eventi di sistema, non parlato trascritto.
+              const textEl = el.matches("[class*='entryText']")
+                ? el
+                : el.querySelector("[class*='entryText']");
+              if (!textEl) return;
               const text = (textEl.innerText || "").trim();
               if (!text) return;
-
-              const pos = textEl.getAttribute("aria-posinset")
-                       || el.querySelector("[aria-posinset]")?.getAttribute("aria-posinset")
-                       || el.getAttribute("aria-posinset")
-                       || "";
 
               let label = "";
               let curr = el;
@@ -510,43 +598,61 @@ async def collect_virtualized_dom_transcript(page: Page) -> list[dict[str, Any]]
             });
           }
 
-          scroller.scrollTop = 0;
-          await sleep(500);
+          function hasAllPositions() {
+            if (!expectedCount || observedPositions.size < expectedCount) return false;
+            for (let pos = 1; pos <= expectedCount; pos++) {
+              if (!observedPositions.has(pos)) return false;
+            }
+            return true;
+          }
 
-          let lastTop = -1;
-          let stuck = 0;
+          let reachedBottom = false;
+          for (let pass = 0; pass < 2; pass++) {
+            scroller.scrollTop = 0;
+            await sleep(350);
+            let noProgress = 0;
+            let bottomRounds = 0;
 
-          for (let round = 0; round < 800; round++) {
-            collectVisible();
+            for (let round = 0; round < 800; round++) {
+              collectVisible();
+              if (hasAllPositions()) {
+                break;
+              }
 
-            const maxTop = Math.max(
-              0,
-              scroller.scrollHeight - scroller.clientHeight
-            );
+              const currentTop = scroller.scrollTop;
+              const maxTop = Math.max(
+                0, scroller.scrollHeight - scroller.clientHeight
+              );
+              const step = Math.max(
+                1, Math.floor(scroller.clientHeight * (pass === 0 ? 0.4 : 0.25))
+              );
+              scroller.scrollTop = Math.min(maxTop, currentTop + step);
+              await sleep(180);
+              collectVisible();
 
-            const currentTop = scroller.scrollTop;
-            const step = Math.max(
-              220,
-              Math.floor((scroller.clientHeight || 500) * 0.65)
-            );
+              const newTop = scroller.scrollTop;
+              const newMaxTop = Math.max(
+                0, scroller.scrollHeight - scroller.clientHeight
+              );
+              if (maxTop > currentTop + 2 && newTop <= currentTop + 1) {
+                noProgress++;
+                if (noProgress >= 3) {
+                  throw new Error("Lo scroller del transcript non avanza.");
+                }
+              } else {
+                noProgress = 0;
+              }
 
-            const nextTop = Math.min(maxTop, currentTop + step);
-            scroller.scrollTop = nextTop;
-
-            await sleep(160);
-
-            if (Math.abs(nextTop - lastTop) < 1) {
-              stuck++;
-              if (stuck > 2) await sleep(600);
-            } else {
-              stuck = 0;
+              bottomRounds = newTop >= newMaxTop - 2
+                ? bottomRounds + 1
+                : 0;
+              if (bottomRounds >= 8) {
+                reachedBottom = true;
+                break;
+              }
             }
 
-            lastTop = nextTop;
-
-            if (nextTop >= maxTop - 2 && stuck >= 8) {
-              break;
-            }
+            if (!expectedCount || hasAllPositions()) break;
           }
 
           collectVisible();
@@ -554,25 +660,36 @@ async def collect_virtualized_dom_transcript(page: Page) -> list[dict[str, Any]]
           function parseLabel(label, fullText) {
             let speaker = null;
             let seconds = null;
-            
+
             if (label) {
-                // Formato: PAOLA FESTA 1 ore 2 minuti 23 secondi (o senza ore)
-                let m = label.match(/^(.+?)(?:\\s+(\\d+)\\s+ore?)?\\s+(\\d+)\\s+minuti?\\s+(\\d+)\\s+secondi?/i);
+                // Le etichette Stream cambiano lingua in base al tenant/browser.
+                let m = label.match(
+                    /(?:(\\d+)\\s*(?:hours?|hrs?|or[ae])[,;]?\\s*)?(\\d+)\\s*(?:minutes?|mins?|minut[io])[,;]?\\s*(?:and\\s+)?(\\d+)\\s*(?:seconds?|secs?|second[oi])/i
+                );
                 if (m) {
-                    speaker = m[1].trim();
-                    seconds = Number(m[3]) * 60 + Number(m[4]);
-                    if (m[2]) seconds += Number(m[2]) * 3600;
+                    const timeStart = m.index || 0;
+                    speaker = label.slice(0, timeStart).replace(/[,:\\s–-]+$/, "").trim() || null;
+                    seconds = Number(m[2]) * 60 + Number(m[3]);
+                    if (m[1]) seconds += Number(m[1]) * 3600;
                     return { speaker, seconds };
                 }
-                // Formato: PAOLA FESTA a 01:23
-                m = label.match(/^(.+?)\\s+a\\s+(\\d+):(\\d+)(?::(\\d+))?/i);
+                // Formato: PAOLA FESTA a 01:23 / Speaker at 01:23.
+                m = label.match(/^(.+?)\\s+(?:a|at)\\s+(\\d+):(\\d+)(?::(\\d+))?/i);
                 if (m) {
-                    speaker = m[1].trim();
+                    speaker = m[1].replace(/[,:\\s–-]+$/, "").trim() || null;
                     if (m[4]) {
                         seconds = Number(m[2]) * 3600 + Number(m[3]) * 60 + Number(m[4]);
                     } else {
                         seconds = Number(m[2]) * 60 + Number(m[3]);
                     }
+                    return { speaker, seconds };
+                }
+
+                // Alcuni tenant annunciano solo i secondi trascorsi.
+                m = label.match(/(\\d+)\\s*(?:seconds?|secs?|second[oi])/i);
+                if (m) {
+                    speaker = label.slice(0, m.index).replace(/[,:\\s–-]+$/, "").trim() || null;
+                    seconds = Number(m[1]);
                     return { speaker, seconds };
                 }
             }
@@ -619,13 +736,38 @@ async def collect_virtualized_dom_transcript(page: Page) -> list[dict[str, Any]]
             return a.domIndex - b.domIndex;
           });
 
-          return rows.map((x, i) => ({
-            index: i,
-            start_seconds: x.startSeconds,
-            end_seconds: null,
-            speaker: x.speaker,
-            text: x.text
-          }));
+          const entries = rows.map((x, i) => {
+            const nextStart = rows
+              .slice(i + 1)
+              .find(next => next.startSeconds != null)?.startSeconds;
+            return {
+              index: i,
+              start_seconds: x.startSeconds,
+              end_seconds: x.startSeconds == null
+                ? null
+                : (nextStart == null
+                    ? x.startSeconds + 2
+                    : Math.max(x.startSeconds + 0.25, nextStart)),
+              speaker: x.speaker,
+              text: x.text
+            };
+          });
+
+          let missingCount = null;
+          if (expectedCount) {
+            missingCount = 0;
+            for (let pos = 1; pos <= expectedCount; pos++) {
+              if (!observedPositions.has(pos)) missingCount++;
+            }
+          }
+
+          return {
+            entries,
+            expected_count: expectedCount,
+            observed_count: observedPositions.size,
+            missing_count: missingCount,
+            complete: expectedCount ? hasAllPositions() : reachedBottom
+          };
         }
         """
     )
@@ -647,8 +789,16 @@ def raw_json_to_entries(data: Any) -> dict[str, Any]:
                     "end_seconds": x.get("endSeconds"),
                     "speaker": x.get("speakerDisplayName"),
                     "text": clean_text(x.get("text")),
-                    "start_offset": None,
-                    "end_offset": None,
+                    "start_offset": (
+                        seconds_to_timestamp(x["startSeconds"])
+                        if x.get("startSeconds") is not None
+                        else None
+                    ),
+                    "end_offset": (
+                        seconds_to_timestamp(x["endSeconds"])
+                        if x.get("endSeconds") is not None
+                        else None
+                    ),
                 }
             )
         return {
@@ -662,40 +812,185 @@ def raw_json_to_entries(data: Any) -> dict[str, Any]:
     return normalize_transcript(data)
 
 
-async def auto_login_if_possible(page: Page) -> None:
+def merge_dom_entries(
+    entries: list[dict[str, Any]], dom_entries: list[dict[str, Any]]
+) -> None:
+    """Recupera speaker e tempi mancanti quando il testo identifica la voce."""
+
+    def comparable_text(value: Any) -> str:
+        return re.sub(r"[^\w]+", " ", clean_text(value).casefold()).strip()
+
+    for entry in entries:
+        entry_text = comparable_text(entry.get("text"))
+        if not entry_text:
+            continue
+
+        matches: list[tuple[int, float, dict[str, Any]]] = []
+        entry_start = entry.get("start_seconds")
+        for dom_entry in dom_entries:
+            speaker = clean_text(dom_entry.get("speaker"))
+            dom_text = comparable_text(dom_entry.get("text"))
+            if not dom_text:
+                continue
+
+            if entry_text == dom_text:
+                text_score = 0
+            elif min(len(entry_text), len(dom_text)) >= 16 and (
+                entry_text in dom_text or dom_text in entry_text
+            ):
+                text_score = 1
+            else:
+                continue
+
+            dom_start = dom_entry.get("start_seconds")
+            time_distance = 0.0
+            if entry_start is not None and dom_start is not None:
+                time_distance = abs(float(entry_start) - float(dom_start))
+                if time_distance > 6.0:
+                    continue
+            else:
+                time_distance = 6.1
+            matches.append((text_score, time_distance, dom_entry))
+
+        if matches:
+            best_score = min((score, distance) for score, distance, _ in matches)
+            best_matches = [
+                dom_entry
+                for score, distance, dom_entry in matches
+                if (score, distance) == best_score
+            ]
+
+            # Senza timestamp, testo ripetuto può riferirsi a parlanti diversi.
+            if entry_start is None:
+                identities = {
+                    (
+                        clean_text(item.get("speaker")) or entry.get("speaker"),
+                        item.get("start_seconds"),
+                    )
+                    for item in best_matches
+                }
+                if len(identities) > 1:
+                    continue
+
+            match = best_matches[0]
+            if not entry.get("speaker") and match.get("speaker"):
+                entry["speaker"] = match.get("speaker")
+            if entry_start is None and match.get("start_seconds") is not None:
+                entry["start_seconds"] = match["start_seconds"]
+                entry["start_offset"] = seconds_to_timestamp(match["start_seconds"])
+            if (
+                entry.get("end_seconds") is None
+                and match.get("end_seconds") is not None
+            ):
+                entry["end_seconds"] = match["end_seconds"]
+                entry["end_offset"] = seconds_to_timestamp(match["end_seconds"])
+
+
+OPTIONAL_AUTH_PROMPT = re.compile(
+    r"^(?:not now|skip(?: for now)?|no,? thanks|maybe later|later|"
+    r"do this later|remind me later|"
+    r"non ora|non adesso|salta(?: per ora)?|ignora(?: per ora)?|"
+    r"no grazie|forse più tardi|più tardi)$",
+    re.IGNORECASE,
+)
+
+
+async def dismiss_optional_auth_prompt(page: Page) -> bool:
+    """Salta inviti facoltativi senza toccare le richieste di autenticazione."""
+    for role in ("button", "link"):
+        candidates = page.get_by_role(role, name=OPTIONAL_AUTH_PROMPT, exact=True)
+        try:
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    label = await candidate.inner_text()
+                    print(f"[auth] Salto passaggio facoltativo: {clean_text(label)}")
+                    await candidate.click(timeout=3000)
+                    await page.wait_for_timeout(500)
+                    return True
+        except Exception:
+            # Microsoft può navigare appena il pulsante viene premuto.
+            continue
+    return False
+
+
+async def click_login_submit(page: Page, field: Any) -> None:
+    candidates = page.locator(
+        '#idSIButton9, button[type="submit"], input[type="submit"]'
+    )
+    for index in range(await candidates.count()):
+        candidate = candidates.nth(index)
+        if await candidate.is_visible() and await candidate.is_enabled():
+            await candidate.click(timeout=5000)
+            return
+    await field.press("Enter")
+
+
+async def auto_login_if_possible(
+    page: Page, attempted_steps: set[tuple[str, str]]
+) -> None:
     email = os.environ.get("MICROSOFT_EMAIL")
     password = os.environ.get("MICROSOFT_PASSWORD")
     if not email or not password:
         return
 
     try:
-        email_input = page.locator('input[type="email"]')
-        if await email_input.is_visible():
-            val = await email_input.input_value()
-            if not val:
-                print("[auth] Auto-compilazione email...")
-                await email_input.fill(email)
-                await page.locator('input[type="submit"], button[type="submit"], #idSIButton9').first.click()
-                await page.wait_for_timeout(2000)
+        email_input = page.locator(
+            'input[type="email"], input[name="loginfmt"], '
+            'input[name="UserName"], #userNameInput, input[autocomplete="username"]'
+        )
+        password_input = page.locator(
+            'input[type="password"], input[name="passwd"], '
+            'input[name="Password"], #passwordInput, '
+            'input[autocomplete="current-password"]'
+        )
+        email_field = (
+            email_input.first
+            if await email_input.count() and await email_input.first.is_visible()
+            else None
+        )
+        password_field = (
+            password_input.first
+            if await password_input.count() and await password_input.first.is_visible()
+            else None
+        )
 
-        password_input = page.locator('input[type="password"]')
-        if await password_input.is_visible():
-            val = await password_input.input_value()
-            if not val:
-                print("[auth] Auto-compilazione password...")
-                await password_input.fill(password)
-                await page.locator('input[type="submit"], button[type="submit"], #idSIButton9, #submitButton').first.click()
-                await page.wait_for_timeout(2000)
-                
-        stay_signed_in = page.locator('input[type="submit"], button[type="submit"], #idSIButton9')
-        if await stay_signed_in.is_visible():
-            # Clicca per andare avanti su "Rimani collegato?"
-            btn = stay_signed_in.first
-            if await btn.is_visible():
-                await btn.click()
-                await page.wait_for_timeout(1000)
-    except Exception:
-        pass
+        # ADFS mostra spesso username e password insieme; invia entrambi nello
+        # stesso passaggio. Microsoft Online li presenta invece in schermate separate.
+        fields = []
+        if email_field is not None:
+            fields.append((email_field, email))
+        if password_field is not None:
+            fields.append((password_field, password))
+
+        if fields:
+            stage = "credentials" if len(fields) == 2 else (
+                "email" if email_field is not None else "password"
+            )
+            step = (safe_url(page.url), stage)
+            if step not in attempted_steps:
+                for field, value in fields:
+                    if await field.input_value() != value:
+                        await field.fill(value)
+                attempted_steps.add(step)
+                if len(fields) == 2:
+                    print("[auth] Invio email e password...")
+                else:
+                    print(f"[auth] Invio {stage}...")
+                await click_login_submit(page, fields[-1][0])
+                await page.wait_for_timeout(1200)
+            return
+
+        # "Rimani collegato?" ha scelta esplicita; evita click generici su
+        # pulsanti di consenso o configurazione MFA.
+        stay_signed_in = page.get_by_role(
+            "button", name=re.compile(r"^(?:yes|sì|si)$", re.IGNORECASE), exact=True
+        )
+        if await stay_signed_in.count() and await stay_signed_in.first.is_visible():
+            await stay_signed_in.first.click(timeout=3000)
+            await page.wait_for_timeout(800)
+    except Exception as exc:
+        print(f"[auth] Compilazione automatica sospesa: {exc}")
 
 
 async def wait_for_auth_and_page(page: Page, timeout_ms: int) -> None:
@@ -703,13 +998,16 @@ async def wait_for_auth_and_page(page: Page, timeout_ms: int) -> None:
     Attende che SharePoint sia realmente caricata.
     Al primo avvio può apparire la pagina di login Microsoft.
     """
-    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000.0
     last_url = ""
+    last_auth_notice_url = ""
+    attempted_login_steps: set[tuple[str, str]] = set()
 
-    while asyncio.get_event_loop().time() < deadline:
+    while loop.time() < deadline:
         current_url = page.url
         if current_url != last_url:
-            print(f"[browser] URL: {current_url}")
+            print(f"[browser] URL: {safe_url(current_url)}")
             last_url = current_url
 
         host = urlparse(current_url).netloc.lower()
@@ -721,17 +1019,23 @@ async def wait_for_auth_and_page(page: Page, timeout_ms: int) -> None:
                 "login.microsoftonline.com",
                 "login.microsoft.com",
                 "account.microsoft.com",
+                "myaccount.microsoft.com",
+                "mysignins.microsoft.com",
+                "account.activedirectory.windowsazure.com",
             )
         ) or "adfs" in current_url.lower() or "login" in host
 
         if login_like:
+            if await dismiss_optional_auth_prompt(page):
+                continue
             if os.environ.get("MICROSOFT_EMAIL") and os.environ.get("MICROSOFT_PASSWORD"):
-                await auto_login_if_possible(page)
-            else:
+                await auto_login_if_possible(page, attempted_login_steps)
+            elif current_url != last_auth_notice_url:
                 print(
                     "[auth] Completa il login Microsoft nella finestra Chromium. "
                     "Se vuoi l'auto-login, inserisci MICROSOFT_EMAIL e MICROSOFT_PASSWORD nel file .env"
                 )
+                last_auth_notice_url = current_url
         else:
             # Una volta rientrati su SharePoint, prosegui.
             if "sharepoint.com" in host:
@@ -779,7 +1083,7 @@ async def main() -> int:
     print("=" * 72)
     print("Microsoft Stream / SharePoint transcript extractor")
     print("=" * 72)
-    print(f"URL        : {args.url}")
+    print(f"URL        : {safe_url(args.url)}")
     print(f"Profilo    : {profile_dir}")
     print(f"Output     : {out_dir}")
     print()
@@ -818,7 +1122,6 @@ async def main() -> int:
             return
 
         print(f"[network] Transcript intercettato: HTTP {response.status}")
-        print(f"[network] Content-Type: {content_type}")
         print(f"[network] URL: {url.split('?', 1)[0]}...")
 
         captured["body"] = body
@@ -827,16 +1130,30 @@ async def main() -> int:
         capture_event.set()
 
     async with async_playwright() as pw:
-        context: BrowserContext = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=False,
-            viewport={"width": 1440, "height": 1000},
-            locale="it-IT",
-            timezone_id="Europe/Rome",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+        try:
+            context: BrowserContext = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=False,
+                viewport={"width": 1440, "height": 1000},
+                locale="it-IT",
+                timezone_id="Europe/Rome",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+        except Exception as exc:
+            error = str(exc).casefold()
+            profile_busy = "processsingleton" in error or (
+                "profile directory" in error
+                and ("already in use" in error or "lock file" in error)
+            )
+            if profile_busy:
+                raise RuntimeError(
+                    f"Profilo Chromium già in uso: {profile_dir}. "
+                    "Chiudi l'altra istanza dello script o Chromium aperto "
+                    "con questo profilo, poi riprova."
+                ) from exc
+            raise
 
         page = context.pages[0] if context.pages else await context.new_page()
         page.on("response", handle_response)
@@ -929,35 +1246,42 @@ async def main() -> int:
                         raw_data = None
 
             print("[5/6] Raccolta della lista transcript virtualizzata dal DOM per i relatori...")
+            dom_entries: list[dict[str, Any]] = []
+            dom_result: Optional[dict[str, Any]] = None
+            dom_error: Optional[Exception] = None
             try:
-                dom_entries = await collect_virtualized_dom_transcript(page)
-                print(f"[dom] Raccolte {len(dom_entries)} voci dalla lista virtualizzata.")
+                dom_result = await collect_virtualized_dom_transcript(page)
+                dom_entries = dom_result["entries"]
+                print(
+                    f"[dom] Raccolte {len(dom_entries)} voci; "
+                    f"posizioni visitate {dom_result['observed_count']}/"
+                    f"{dom_result['expected_count'] or '?'}: "
+                    f"{'completa' if dom_result['complete'] else 'incompleta'}."
+                )
             except Exception as exc:
                 print(f"[dom] Fallito recupero DOM: {exc}")
-                dom_entries = []
+                dom_error = exc
 
             if raw_data is None:
                 if not dom_entries:
                     raise RuntimeError(
-                        "Nessun transcript trovato né via API né nel DOM."
+                        f"Nessun transcript trovato via API o DOM: {dom_error}"
+                        if dom_error else "Nessun transcript trovato via API o DOM."
+                    ) from dom_error
+                if dom_result is not None and not dom_result["complete"]:
+                    raise RuntimeError(
+                        "Trascrizione DOM incompleta: "
+                        f"{dom_result['observed_count']}/"
+                        f"{dom_result['expected_count'] or '?'} posizioni visitate."
                     )
-
-                normalized = {
-                    "format": "teams-transcript-dom-fallback",
-                    "source": metadata,
-                    "entry_count": len(dom_entries),
-                    "entries": dom_entries,
-                    "_raw_response": None,
-                }
-                raw_data = normalized
 
                 data = normalize_transcript(
                     {
                         "entries": [
                             {
                                 "speakerDisplayName": e.get("speaker"),
-                                "startOffset": None,
-                                "endOffset": None,
+                                "startSeconds": e.get("start_seconds"),
+                                "endSeconds": e.get("end_seconds"),
                                 "text": e.get("text"),
                             }
                             for e in dom_entries
@@ -965,37 +1289,14 @@ async def main() -> int:
                     },
                     metadata=metadata,
                 )
-                # Mantieni ordine e timestamp del fallback DOM.
-                for a, b in zip(data["entries"], dom_entries):
-                    a["start_seconds"] = b.get("start_seconds")
-                    a["end_seconds"] = b.get("end_seconds")
+                data["format"] = "teams-transcript-dom-fallback"
             else:
                 print("[5.5/6] Normalizzazione transcript JSON e merge relatori...")
                 data = raw_json_to_entries(raw_data)
                 data["source"] = metadata
 
                 if dom_entries:
-                    # Ottimizza la ricerca dei relatori
-                    for api_e in data.get("entries", []):
-                        if api_e.get("speaker"):
-                            continue
-                        
-                        api_text = api_e.get("text", "").lower()
-                        api_ts = api_e.get("start_seconds")
-                        
-                        for dom_e in dom_entries:
-                            if not dom_e.get("speaker"):
-                                continue
-                            
-                            dom_ts = dom_e.get("start_seconds")
-                            if api_ts is not None and dom_ts is not None:
-                                if abs(api_ts - dom_ts) > 6.0:
-                                    continue
-                            
-                            dom_text = dom_e.get("text", "").lower()
-                            if dom_text and (dom_text in api_text or api_text in dom_text):
-                                api_e["speaker"] = dom_e["speaker"]
-                                break
+                    merge_dom_entries(data.get("entries", []), dom_entries)
 
             if source_url:
                 data["source"]["transcript_endpoint"] = source_url.split("?", 1)[0]
@@ -1008,6 +1309,18 @@ async def main() -> int:
             if data["entry_count"] == 0:
                 raise RuntimeError(
                     "Il transcript è stato recuperato ma contiene 0 entries."
+                )
+
+            missing_start = sum(
+                entry.get("start_seconds") is None for entry in data["entries"]
+            )
+            missing_speaker = sum(
+                not entry.get("speaker") for entry in data["entries"]
+            )
+            if missing_start or missing_speaker:
+                print(
+                    "[!] Campi ancora assenti dopo API e DOM: "
+                    f"timestamp iniziali {missing_start}, relatori {missing_speaker}."
                 )
 
             print("[6/6] Scrittura output...")
