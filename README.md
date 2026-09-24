@@ -14,37 +14,21 @@ Scarica la trascrizione di una lezione registrata su **Microsoft Stream / ShareP
 
 ---
 
-## Installazione
-
-Servono Python 3.9 o superiore. Crea ambiente e installa dipendenze.
-
-### Windows (PowerShell)
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m playwright install chromium
-```
-
-### Linux
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m playwright install chromium
-```
-
-Su Ubuntu/Debian, se Chromium segnala librerie di sistema mancanti:
-
-```bash
-.venv/bin/python -m playwright install --with-deps chromium
-```
-
----
-
 ## Configurazione
 
-Crea un file `.env` nella cartella del progetto:
+Crea il file `.env` a partire dall'esempio:
+
+```bash
+cp .env.example .env
+```
+oppure
+
+```cmd
+copy .env.example .env
+```
+
+
+Modifica `.env`:
 
 ```env
 STREAM_URL="https://tuo-istituto.sharepoint.com/sites/.../stream.aspx?id=..."
@@ -60,12 +44,29 @@ Durante l'accesso, completa eventuali verifiche richieste dall'istituto. Inviti 
 
 ---
 
+## Installazione
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+```
+
+---
+
+
 ## Esecuzione
 
-Windows (PowerShell):
+```bash
+# Con venv attivo (consigliato)
+python extract_stream_transcript.py
 
-```powershell
-.\.venv\Scripts\python.exe extract_stream_transcript.py --url "https://..." --out-dir ".\output" --timeout-minutes 10
+# Oppure con argomenti da CLI (sovrascrivono .env)
+python extract_stream_transcript.py \
+  --url "https://..." \
+  --out-dir "./output" \
+  --timeout-minutes 10
 ```
 
 Linux:
