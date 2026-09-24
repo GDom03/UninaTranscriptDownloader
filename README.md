@@ -14,15 +14,6 @@ Scarica la trascrizione di una lezione registrata su **Microsoft Stream / ShareP
 
 ---
 
-## Installazione
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-```
-
----
-
 ## Configurazione
 
 Crea il file `.env` a partire dall'esempio:
@@ -30,6 +21,12 @@ Crea il file `.env` a partire dall'esempio:
 ```bash
 cp .env.example .env
 ```
+oppure
+
+```cmd
+copy .env.example .env
+```
+
 
 Modifica `.env`:
 
@@ -43,14 +40,26 @@ MICROSOFT_PASSWORD="tuapassword"
 
 ---
 
+## Installazione
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+```
+
+---
+
+
 ## Esecuzione
 
 ```bash
 # Con venv attivo (consigliato)
-.venv/bin/python extract_stream_transcript.py
+python extract_stream_transcript.py
 
 # Oppure con argomenti da CLI (sovrascrivono .env)
-.venv/bin/python extract_stream_transcript.py \
+python extract_stream_transcript.py \
   --url "https://..." \
   --out-dir "./output" \
   --timeout-minutes 10
