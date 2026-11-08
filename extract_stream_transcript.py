@@ -1056,12 +1056,12 @@ async def wait_for_auth_and_page(page: Page, timeout_ms: int) -> None:
 
 
 async def open_transcript_panel(page: Page) -> bool:
-    """Apre la scheda Trascrizione usando etichette accessibili IT/EN e verifica il risultato."""
+    """Apre il pannello transcript se disponibile, senza bloccare i fallback API."""
     transcript_items = page.locator(
         "#OneTranscript [aria-posinset], [data-automationid*='transcript' i] [aria-posinset]"
     )
     try:
-        if await transcript_items.first.is_visible(timeout=1000):
+        if await transcript_items.first.is_visible(timeout=300):
             print("[transcript] Pannello già aperto.")
             return True
     except Exception:
@@ -1077,43 +1077,73 @@ async def open_transcript_panel(page: Page) -> bool:
         "[role='tab'][aria-label*='trascriz' i]",
         "[role='tab'][aria-label*='transcript' i]",
     )
-    for selector in selectors:
-        candidates = page.locator(selector)
-        for index in range(await candidates.count()):
-            candidate = candidates.nth(index)
-            try:
-                if await candidate.is_visible() and await candidate.is_enabled():
-                    label = (await candidate.get_attribute("aria-label")) or selector
-                    await candidate.click(timeout=5000)
-                    print(f"[transcript] Selezionato: {clean_text(label)}")
-                    break
-            except Exception:
-                continue
-        else:
-            continue
-        break
-    else:
-        for pattern in patterns:
-            candidate = page.get_by_text(pattern).first
-            try:
-                if await candidate.is_visible(timeout=1000):
-                    await candidate.click(timeout=5000)
-                    print(f"[transcript] Selezionata scheda: {clean_text(await candidate.inner_text())}")
-                    break
-            except Exception:
-                continue
-        else:
-            raise RuntimeError(
-                "Non trovo il comando Trascrizione nella pagina. Verifica che la registrazione abbia una trascrizione e che SharePoint abbia finito di caricare."
-            )
+    clicked: set[tuple[str, int]] = set()
+    for _ in range(10):
+        try:
+            if await transcript_items.first.is_visible(timeout=300):
+                print("[transcript] Pannello aperto.")
+                return True
+        except Exception:
+            pass
 
-    try:
-        await transcript_items.first.wait_for(state="visible", timeout=15000)
-        print("[transcript] Pannello aperto.")
-        return True
-    except Exception:
-        # Alcune pagine caricano l'API senza esporre subito le righe virtualizzate.
-        return False
+        candidate_groups = [
+            (f"role:{role}", page.get_by_role(role, name=patterns[0]))
+            for role in ("button", "tab")
+        ]
+        candidate_groups.extend(
+            (f"text:{pattern.pattern}", page.get_by_text(pattern))
+            for pattern in patterns
+        )
+        candidate_groups.extend(
+            (f"selector:{selector}", page.locator(selector))
+            for selector in selectors
+        )
+
+        selected = False
+        for group_name, candidates in candidate_groups:
+            try:
+                count = await candidates.count()
+            except Exception:
+                continue
+            for index in range(count):
+                identity = (group_name, index)
+                if identity in clicked:
+                    continue
+                candidate = candidates.nth(index)
+                try:
+                    if not await candidate.is_visible() or not await candidate.is_enabled():
+                        continue
+                    await candidate.click(timeout=3000)
+                    clicked.add(identity)
+                    label = clean_text(await candidate.get_attribute("aria-label") or "")
+                    if not label:
+                        label = clean_text(await candidate.inner_text())
+                    print(f"[transcript] Selezionato comando: {label or group_name}")
+                    selected = True
+                    break
+                except Exception:
+                    continue
+            if selected:
+                break
+
+        if selected:
+            try:
+                await transcript_items.first.wait_for(state="visible", timeout=1200)
+                print("[transcript] Pannello aperto.")
+                return True
+            except Exception:
+                # Il click può attivare il pannello prima che le righe siano
+                # caricate; attendi e controlla nuovamente la pagina.
+                pass
+        await page.wait_for_timeout(500)
+
+    print(
+        "[transcript] Comando non disponibile o pannello non caricato; "
+        "continuo con il recupero via API e i fallback."
+    )
+    # Il pannello serve per arricchire gli speaker, ma il transcript può essere
+    # recuperato dalle API o dal traffico già intercettato.
+    return False
 
 
 async def main() -> int:
@@ -1139,7 +1169,7 @@ async def main() -> int:
         "--timeout-minutes",
         type=int,
         default=15,
-        help="Timeout login/caricamento in minuti; 0 lo disattiva (default: 15)",
+        help="Timeout login/caricamento in minuti; 0 lo disattiva",
     )
     parser.add_argument(
         "--browser-executable",

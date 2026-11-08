@@ -15,11 +15,12 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, filedialog, messagebox
+from tkinter import font as tkfont
 from urllib.parse import parse_qs, unquote, urlparse
 
 import customtkinter as ctk
 from PIL import Image
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key, unset_key
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -48,6 +49,82 @@ ROW_RED_HOVER = ("#fff0ef", "#3a2424")
 ACTIVITY_BG = ("#f8f8fa", "#232326")
 SCROLLBAR = ("#c7c7cc", "#48484a")
 SCROLLBAR_HOVER = ("#aeaeb2", "#636366")
+
+
+def detect_linux_display_scale() -> float:
+    """Return the desktop's UI scale factor where the window is running.
+
+    Mutter exposes the active per-monitor factor over its DisplayConfig D-Bus
+    API, including fractional values such as 1.5. Fall back to the saved GNOME
+    monitor configuration, explicit toolkit environment variables, and Xft
+    DPI for other Linux desktops.
+    """
+    if os.environ.get("XDG_SESSION_TYPE", "").casefold() == "wayland":
+        try:
+            result = subprocess.run(
+                ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.DisplayConfig",
+                 "--object-path", "/org/gnome/Mutter/DisplayConfig", "--method",
+                 "org.gnome.Mutter.DisplayConfig.GetCurrentState"],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+            if result.returncode == 0:
+                monitors = re.findall(
+                    r"\(\d+,\s*\d+,\s*([0-9]+(?:\.[0-9]+)?),\s*uint32\s+\d+,\s*(true|false),\s*\[",
+                    result.stdout,
+                )
+                if monitors:
+                    primary = next((scale for scale, is_primary in monitors if is_primary == "true"), None)
+                    value = float(primary if primary is not None else monitors[0][0])
+                    if 0.75 <= value <= 4.0:
+                        return value
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+    for variable in ("GDK_SCALE", "QT_SCALE_FACTOR"):
+        try:
+            value = float(os.environ.get(variable, ""))
+            if 0.75 <= value <= 4.0:
+                return value
+        except ValueError:
+            pass
+
+    # GNOME stores the active per-monitor scale here on installations where
+    # Mutter's D-Bus interface is unavailable (for example, outside the GUI
+    # session). Prefer the primary logical monitor when there are several.
+    try:
+        import xml.etree.ElementTree as ET
+
+        for path in (Path.home() / ".config/monitors.xml", Path("/etc/xdg/monitors.xml")):
+            if not path.is_file():
+                continue
+            root = ET.parse(path).getroot()
+            scales = []
+            for logical_monitor in root.findall(".//logicalmonitor"):
+                scale_text = logical_monitor.findtext("scale")
+                if not scale_text:
+                    continue
+                scales.append((float(scale_text), logical_monitor.findtext("primary") == "yes"))
+            if scales:
+                value = next((scale for scale, primary in scales if primary), scales[0][0])
+                if 0.75 <= value <= 4.0:
+                    return value
+    except (OSError, ET.ParseError, ValueError):
+        pass
+
+    # X11 desktops commonly publish their global scale as Xft.dpi.
+    try:
+        result = subprocess.run(
+            ["xrdb", "-query"], capture_output=True, text=True, timeout=2, check=False,
+        )
+        match = re.search(r"^\s*Xft\.dpi:\s*([0-9.]+)", result.stdout, re.MULTILINE | re.IGNORECASE)
+        if match:
+            value = float(match.group(1)) / 96.0
+            if 0.75 <= value <= 4.0:
+                return value
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+    return 1.0
 
 
 def recording_title_from_url(url: str) -> str:
@@ -136,24 +213,42 @@ class Task:
 class TranscriptApp:
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
+        if sys.platform.startswith("linux"):
+            # Normalize Tk's font conversion to the Windows pixel-sized CTk
+            # typography. The actual desktop zoom is applied separately below
+            # through CustomTkinter's widget/window scale factors.
+            self.root.tk.call("tk", "scaling", 2.67)
         self.root.title("Unina Transcript Downloader")
         self.root.geometry("1080x800")
         self.root.minsize(820, 660)
         self.root.configure(fg_color=BG)
 
+        # Tk silently substitutes a missing family, and the substitute can
+        # have very different metrics (notably on Linux). Those metrics affect
+        # button widths, line wrapping and the height of every grid row.
+        available_fonts = {name.casefold(): name for name in tkfont.families(root)}
         if sys.platform == "darwin":
-            self.font_family = "SF Pro Display"
+            preferred_fonts = ("SF Pro Display", "Helvetica Neue", "Arial")
         elif os.name == "nt":
-            self.font_family = "Segoe UI"
+            preferred_fonts = ("Segoe UI", "Arial")
         else:
-            self.font_family = "Noto Sans"
+            # CustomTkinter bundles Roboto on Linux, so this keeps text
+            # metrics consistent even when the distro has no Noto Sans.
+            preferred_fonts = ("Roboto", "Noto Sans", "DejaVu Sans", "Arial", "Liberation Sans")
+        self.font_family = next(
+            (available_fonts[name.casefold()] for name in preferred_fonts
+             if name.casefold() in available_fonts),
+            "TkDefaultFont",
+        )
 
         self.output_dir = StringVar(value=str(APP_DIR / "output"))
-        self.url_var = StringVar(value=os.environ.get("STREAM_URL", ""))
+        # Keep the URL field empty; each extraction should be explicitly
+        # selected by the user instead of reusing a stale .env URL.
+        self.url_var = StringVar(value="")
         self.timeout_minutes = StringVar(value="15")
         self.browser_executable = StringVar(value="")
         self.auto_save_state = BooleanVar(value=True)
-        self.dark_mode = BooleanVar(value=False)
+        self.dark_mode = BooleanVar(value=True)
         self.tasks: list[Task] = []
         self.messages: queue.Queue[tuple] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -193,6 +288,10 @@ class TranscriptApp:
             ico = APP_DIR / "assets" / "app_icon.ico"
             if os.name == "nt" and ico.exists():
                 self.root.iconbitmap(str(ico))
+            elif sys.platform.startswith("linux"):
+                # Give X11/Wayland task switchers a stable app identity and
+                # the same icon used by the window manager.
+                self.root.wm_class("unina-transcript-downloader", "UninaTranscriptDownloader")
         except Exception:
             pass
 
@@ -391,6 +490,8 @@ class TranscriptApp:
         output_var = StringVar(value=self.output_dir.get())
         timeout_var = StringVar(value=self.timeout_minutes.get())
         browser_var = StringVar(value=self.browser_executable.get())
+        email_var = StringVar(value=os.environ.get("MICROSOFT_EMAIL", ""))
+        password_var = StringVar(value=os.environ.get("MICROSOFT_PASSWORD", ""))
         save_state_var = BooleanVar(value=self.auto_save_state.get())
         dark_mode_var = BooleanVar(value=self.dark_mode.get())
 
@@ -435,17 +536,30 @@ class TranscriptApp:
         ).grid(row=11, column=0, sticky="w")
         self._settings_hint(panel, "La modalità scelta si applica dopo aver salvato.", 12)
 
-        self._settings_label(panel, "Sessione e stato", 13)
+        self._settings_label(panel, "Credenziali Microsoft", 13)
+        ctk.CTkLabel(panel, text="Email", text_color=SECONDARY,
+                     font=ctk.CTkFont(self.font_family, 11)).grid(row=14, column=0, sticky="w", pady=(2, 4))
+        ctk.CTkEntry(panel, textvariable=email_var, height=40, corner_radius=11).grid(
+            row=15, column=0, sticky="ew"
+        )
+        ctk.CTkLabel(panel, text="Password", text_color=SECONDARY,
+                     font=ctk.CTkFont(self.font_family, 11)).grid(row=16, column=0, sticky="w", pady=(10, 4))
+        ctk.CTkEntry(panel, textvariable=password_var, show="•", height=40, corner_radius=11).grid(
+            row=17, column=0, sticky="ew"
+        )
+        self._settings_hint(panel, "Lascia vuoti entrambi i campi per usare il login manuale. Le credenziali vengono salvate nel file .env locale.", 18)
+
+        self._settings_label(panel, "Sessione e stato", 19)
         ctk.CTkCheckBox(panel, text="Salva automaticamente impostazioni e coda",
                         variable=save_state_var, corner_radius=6, checkbox_width=20,
                         checkbox_height=20, fg_color=BLUE, hover_color=BLUE_HOVER,
-                        font=ctk.CTkFont(self.font_family, 13)).grid(row=14, column=0, sticky="w")
+                        font=ctk.CTkFont(self.font_family, 13)).grid(row=20, column=0, sticky="w")
         ctk.CTkLabel(
             panel,
-            text="La sessione SharePoint resta nel profilo Chromium persistente. Le credenziali continuano a essere lette da .env.",
+            text="La sessione SharePoint resta nel profilo Chromium persistente.",
             text_color=SECONDARY, wraplength=600, justify="left",
             font=ctk.CTkFont(self.font_family, 11),
-        ).grid(row=15, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=21, column=0, sticky="w", pady=(8, 0))
 
         buttons = ctk.CTkFrame(dialog, fg_color="transparent", corner_radius=0)
         buttons.grid(row=1, column=0, sticky="ew", padx=26, pady=(8, 16))
@@ -465,6 +579,28 @@ class TranscriptApp:
                 return
             if not output_var.get().strip():
                 messagebox.showerror("Cartella mancante", "Scegli la cartella di destinazione.", parent=dialog)
+                return
+            email = email_var.get().strip()
+            password = password_var.get()
+            if bool(email) != bool(password):
+                messagebox.showerror(
+                    "Credenziali incomplete", "Inserisci sia l'email sia la password, oppure lascia vuoti entrambi i campi.", parent=dialog
+                )
+                return
+            env_file = APP_DIR / ".env"
+            try:
+                if email:
+                    set_key(str(env_file), "MICROSOFT_EMAIL", email, quote_mode="always")
+                    set_key(str(env_file), "MICROSOFT_PASSWORD", password, quote_mode="always")
+                    os.environ["MICROSOFT_EMAIL"] = email
+                    os.environ["MICROSOFT_PASSWORD"] = password
+                else:
+                    unset_key(str(env_file), "MICROSOFT_EMAIL")
+                    unset_key(str(env_file), "MICROSOFT_PASSWORD")
+                    os.environ.pop("MICROSOFT_EMAIL", None)
+                    os.environ.pop("MICROSOFT_PASSWORD", None)
+            except OSError as exc:
+                messagebox.showerror("Salvataggio credenziali non riuscito", str(exc), parent=dialog)
                 return
             self.output_dir.set(output_var.get().strip())
             self.timeout_minutes.set(str(timeout))
@@ -747,7 +883,7 @@ class TranscriptApp:
             self.timeout_minutes.set(str(settings.get("timeout_minutes", 15)))
             self.browser_executable.set(settings.get("browser_executable", ""))
             self.auto_save_state.set(bool(settings.get("auto_save_state", True)))
-            self.dark_mode.set(bool(settings.get("dark_mode", False)))
+            self.dark_mode.set(bool(settings.get("dark_mode", True)))
             ctk.set_appearance_mode("Dark" if self.dark_mode.get() else "Light")
             output_root = Path(self.output_dir.get()).expanduser()
             for saved in state.get("queue", []):
@@ -808,14 +944,36 @@ def ImageTkPhotoImage(path: Path):
 
 
 def main() -> None:
-    dark_mode = False
+    dark_mode = True
     try:
         saved = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        dark_mode = bool((saved.get("settings") or {}).get("dark_mode", False))
+        dark_mode = bool((saved.get("settings") or {}).get("dark_mode", True))
     except (OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     ctk.set_appearance_mode("Dark" if dark_mode else "Light")
     ctk.set_default_color_theme("blue")
+    if sys.platform.startswith("linux"):
+        # Tk does not automatically apply Linux desktop scaling to CTk
+        # geometry. Read the active monitor factor (including GNOME fractional
+        # scaling) and apply it consistently to text, controls and the window.
+        display_scale = detect_linux_display_scale()
+        ctk.set_widget_scaling(display_scale)
+        ctk.set_window_scaling(display_scale)
+        # The font based corner renderer can fall back to jagged or square
+        # corners when fontconfig does not expose CTk's bundled glyph font.
+        # Polygon rendering keeps cards and buttons rounded without that dependency.
+        from customtkinter.windows.widgets.core_rendering import DrawEngine
+        DrawEngine.preferred_drawing_method = "polygon_shapes"
+    if os.name == "nt":
+        # Windows groups taskbar buttons by AppUserModelID. Without an
+        # explicit ID, Tk launched from Python may inherit the generic icon.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "UninaTranscriptDownloader.Desktop"
+            )
+        except (AttributeError, OSError):
+            pass
     root = ctk.CTk()
     TranscriptApp(root)
     root.mainloop()

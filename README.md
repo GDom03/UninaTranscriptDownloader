@@ -7,7 +7,7 @@ Scarica la trascrizione di una lezione registrata su **Microsoft Stream / ShareP
 ## Come funziona
 
 1. Apre Chromium con un profilo persistente (`.pw-sharepoint-profile`).
-2. Se non è già loggato, compila automaticamente email e password dal file `.env`.
+2. Se non è già loggato, compila automaticamente email e password configurate nelle Impostazioni della GUI o nel file `.env`.
 3. Apre il pannello "Trascrizione" nella pagina del video.
 4. Recupera i dati tramite l'API interna di Microsoft Stream; se non disponibile, legge il DOM come fallback.
 5. Arricchisce ogni voce con il nome del relatore e il timestamp, poi salva i file di output.
@@ -16,7 +16,7 @@ Scarica la trascrizione di una lezione registrata su **Microsoft Stream / ShareP
 
 ## Configurazione
 
-Crea il file `.env` a partire dall'esempio:
+Crea il file `.env` a partire dall'esempio (facoltativo se usi la GUI):
 
 ```bash
 cp .env.example .env
@@ -28,7 +28,7 @@ copy .env.example .env
 ```
 
 
-Modifica `.env`:
+Per configurare il login dalla riga di comando, modifica `.env`:
 
 ```env
 STREAM_URL="https://tuo-istituto.sharepoint.com/sites/.../stream.aspx?id=..."
@@ -38,7 +38,7 @@ MICROSOFT_EMAIL="tua@email.it"
 MICROSOFT_PASSWORD="tua password"
 ```
 
-Lo script carica `.env` dalla propria cartella. In alternativa, passa l'URL con `--url`.
+Lo script carica `.env` dalla propria cartella. In alternativa, puoi inserire email e password in **Impostazioni → Credenziali Microsoft** nella GUI: vengono salvate in `.env` accanto all'app e usate ai successivi avvii. Lascia vuoti entrambi i campi per rimuovere le credenziali salvate e accedere manualmente. Il file `.env` contiene dati in testo leggibile: tienilo sul tuo computer e non condividerlo. Per l'URL puoi usare `.env` oppure passare `--url`.
 
 Durante l'accesso, completa eventuali verifiche richieste dall'istituto. Inviti facoltativi con scelta esatta “Non ora”, “Salta per ora” o equivalenti inglesi vengono saltati automaticamente.
 
@@ -58,7 +58,7 @@ playwright install chromium
 
 ## Esecuzione
 
-Su Windows, dopo aver configurato `.env`, avvia l'interfaccia grafica con un solo comando:
+Su Windows, avvia l'interfaccia grafica con un solo comando:
 
 ```cmd
 Avvia.bat
@@ -66,9 +66,9 @@ Avvia.bat
 
 Al primo avvio il file crea l'ambiente virtuale e installa dipendenze e Chromium. Incolla uno o più link SharePoint e aggiungili alla coda. Ogni riga ha i pulsanti per copiare il link, cambiare il nome della cartella di output o rimuovere la registrazione dalla coda. Scegli la cartella generale da **Impostazioni** e premi **Avvia estrazione**. Ogni registrazione viene salvata in una sottocartella col nome ricavato dall'URL SharePoint (per esempio `Programmazione Lineare Intera`), con i file JSON, TXT e VTT al suo interno. Se l'URL non contiene un nome leggibile, usa i metadati della registrazione. Se quel nome esiste già, viene aggiunto un suffisso numerico per non sovrascrivere la cartella precedente.
 
-Il logo originale è conservato in `assets/logo_source.jfif`; i ritagli `logo_header.png` e `app_icon.png` vengono usati nella GUI e `app_icon.ico` come icona finestra su Windows. Le icone monocromatiche PNG dei pulsanti sono in `assets/icons/`.
+Il logo originale è conservato in `assets/logo_source.jfif`; i ritagli `logo_header.png` e `app_icon.png` vengono usati nella GUI e `app_icon.ico` come icona finestra e della barra delle applicazioni su Windows. Su Linux la finestra comunica la stessa icona al gestore desktop e usa un'identità stabile per la barra delle applicazioni. Le icone monocromatiche PNG dei pulsanti sono in `assets/icons/`.
 
-In **Impostazioni** puoi cambiare cartella di destinazione, timeout del browser (0 = nessun limite), percorso di Chrome/Chromium e attivare la modalità scura. La scelta dell'aspetto viene ricordata tra gli avvii. Il salvataggio automatico conserva coda e impostazioni nel profilo locale; credenziali e sessione restano rispettivamente in `.env` e nel profilo Chromium persistente.
+In **Impostazioni** puoi inserire le credenziali Microsoft, cambiare cartella di destinazione, timeout del browser (0 = nessun limite), percorso di Chrome/Chromium e cambiare tema (scuro predefinito). La scelta dell'aspetto viene ricordata tra gli avvii. Il salvataggio automatico conserva coda e impostazioni nel profilo locale; le credenziali vengono salvate in `.env` accanto all'app e la sessione resta nel profilo Chromium persistente.
 
 Per usare ancora la riga di comando: `Avvia.bat --cli --url "https://..." --out-dir output`.
 
