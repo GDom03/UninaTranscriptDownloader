@@ -1,2 +1,4 @@
 playwright>=1.51
 python-dotenv>=1.0.0
+customtkinter>=5.2.2
+Pillow>=10.0.0

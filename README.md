@@ -58,6 +58,31 @@ playwright install chromium
 
 ## Esecuzione
 
+Su Windows, dopo aver configurato `.env`, avvia l'interfaccia grafica con un solo comando:
+
+```cmd
+Avvia.bat
+```
+
+Al primo avvio il file crea l'ambiente virtuale e installa dipendenze e Chromium. Incolla uno o più link SharePoint e aggiungili alla coda. Ogni riga ha i pulsanti per copiare il link, cambiare il nome della cartella di output o rimuovere la registrazione dalla coda. Scegli la cartella generale da **Impostazioni** e premi **Avvia estrazione**. Ogni registrazione viene salvata in una sottocartella col nome ricavato dall'URL SharePoint (per esempio `Programmazione Lineare Intera`), con i file JSON, TXT e VTT al suo interno. Se l'URL non contiene un nome leggibile, usa i metadati della registrazione. Se quel nome esiste già, viene aggiunto un suffisso numerico per non sovrascrivere la cartella precedente.
+
+Il logo originale è conservato in `assets/logo_source.jfif`; i ritagli `logo_header.png` e `app_icon.png` vengono usati nella GUI e `app_icon.ico` come icona finestra su Windows. Le icone monocromatiche PNG dei pulsanti sono in `assets/icons/`.
+
+In **Impostazioni** puoi cambiare cartella di destinazione, timeout del browser (0 = nessun limite), percorso di Chrome/Chromium e attivare la modalità scura. La scelta dell'aspetto viene ricordata tra gli avvii. Il salvataggio automatico conserva coda e impostazioni nel profilo locale; credenziali e sessione restano rispettivamente in `.env` e nel profilo Chromium persistente.
+
+Per usare ancora la riga di comando: `Avvia.bat --cli --url "https://..." --out-dir output`.
+
+Su Linux rendi eseguibile il launcher una volta e avvialo:
+
+```bash
+chmod +x Avvia.sh
+./Avvia.sh
+```
+
+Anche il launcher Linux prepara automaticamente ambiente, dipendenze e Chromium al primo avvio. Per usare la riga di comando: `./Avvia.sh --cli --url "https://..." --out-dir output`.
+
+La GUI usa CustomTkinter e Pillow; il launcher li installa insieme alle altre dipendenze. Su alcune distribuzioni Linux potrebbe essere necessario installare anche Tk dal gestore pacchetti di sistema (ad esempio `python3-tk`).
+
 ```bash
 # Con venv attivo (consigliato)
 python extract_stream_transcript.py

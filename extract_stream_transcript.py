@@ -347,10 +347,15 @@ async def extract_metadata(page: Page) -> Optional[dict[str, Any]]:
         if (!Array.isArray(list) || !list.length) return null;
 
         const t = list.find(x => x.isDefault) || list[0];
+        const titleElement = document.querySelector(
+          '[data-testid="video-title"], [data-automationid="video-title"], h1, [role="heading"][aria-level="1"]'
+        );
 
         return {
           id: t?.id ?? null,
           displayName: t?.displayName ?? null,
+          videoTitle: titleElement?.innerText?.trim() || null,
+          pageTitle: document.title || null,
           languageTag: t?.languageTag ?? null,
           transcriptType: t?.transcriptType ?? null,
           isVisible: t?.isVisible ?? null,
@@ -999,12 +1004,12 @@ async def wait_for_auth_and_page(page: Page, timeout_ms: int) -> None:
     Al primo avvio può apparire la pagina di login Microsoft.
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_ms / 1000.0
+    deadline = None if timeout_ms <= 0 else loop.time() + timeout_ms / 1000.0
     last_url = ""
     last_auth_notice_url = ""
     attempted_login_steps: set[tuple[str, str]] = set()
 
-    while loop.time() < deadline:
+    while deadline is None or loop.time() < deadline:
         current_url = page.url
         if current_url != last_url:
             print(f"[browser] URL: {safe_url(current_url)}")
@@ -1050,6 +1055,67 @@ async def wait_for_auth_and_page(page: Page, timeout_ms: int) -> None:
     )
 
 
+async def open_transcript_panel(page: Page) -> bool:
+    """Apre la scheda Trascrizione usando etichette accessibili IT/EN e verifica il risultato."""
+    transcript_items = page.locator(
+        "#OneTranscript [aria-posinset], [data-automationid*='transcript' i] [aria-posinset]"
+    )
+    try:
+        if await transcript_items.first.is_visible(timeout=1000):
+            print("[transcript] Pannello già aperto.")
+            return True
+    except Exception:
+        pass
+
+    patterns = (
+        re.compile(r"trascriz|transcript", re.IGNORECASE),
+        re.compile(r"show transcript|mostra trascrizione", re.IGNORECASE),
+    )
+    selectors = (
+        "button[aria-label*='trascriz' i]",
+        "button[aria-label*='transcript' i]",
+        "[role='tab'][aria-label*='trascriz' i]",
+        "[role='tab'][aria-label*='transcript' i]",
+    )
+    for selector in selectors:
+        candidates = page.locator(selector)
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            try:
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    label = (await candidate.get_attribute("aria-label")) or selector
+                    await candidate.click(timeout=5000)
+                    print(f"[transcript] Selezionato: {clean_text(label)}")
+                    break
+            except Exception:
+                continue
+        else:
+            continue
+        break
+    else:
+        for pattern in patterns:
+            candidate = page.get_by_text(pattern).first
+            try:
+                if await candidate.is_visible(timeout=1000):
+                    await candidate.click(timeout=5000)
+                    print(f"[transcript] Selezionata scheda: {clean_text(await candidate.inner_text())}")
+                    break
+            except Exception:
+                continue
+        else:
+            raise RuntimeError(
+                "Non trovo il comando Trascrizione nella pagina. Verifica che la registrazione abbia una trascrizione e che SharePoint abbia finito di caricare."
+            )
+
+    try:
+        await transcript_items.first.wait_for(state="visible", timeout=15000)
+        print("[transcript] Pannello aperto.")
+        return True
+    except Exception:
+        # Alcune pagine caricano l'API senza esporre subito le righe virtualizzate.
+        return False
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(
         description="Estrae transcript JSON/TXT/VTT da Microsoft Stream."
@@ -1073,7 +1139,12 @@ async def main() -> int:
         "--timeout-minutes",
         type=int,
         default=15,
-        help="Tempo massimo per login/caricamento (default: 15)",
+        help="Timeout login/caricamento in minuti; 0 lo disattiva (default: 15)",
+    )
+    parser.add_argument(
+        "--browser-executable",
+        default="",
+        help="Percorso opzionale a Chrome/Chromium personalizzato",
     )
     args = parser.parse_args()
 
@@ -1092,6 +1163,14 @@ async def main() -> int:
         print("ERRORE: Nessun URL fornito.", file=sys.stderr)
         print("Devi passare un URL tramite --url oppure impostare STREAM_URL nel file .env", file=sys.stderr)
         return 1
+
+    if args.timeout_minutes < 0:
+        print("ERRORE: --timeout-minutes deve essere 0 o maggiore.", file=sys.stderr)
+        return 2
+    if args.browser_executable and not Path(args.browser_executable).expanduser().is_file():
+        print("ERRORE: Browser Chrome/Chromium non trovato: " + args.browser_executable, file=sys.stderr)
+        return 2
+    browser_timeout_ms = args.timeout_minutes * 60 * 1000
 
     captured: dict[str, Any] = {}
     capture_event = asyncio.Event()
@@ -1134,6 +1213,7 @@ async def main() -> int:
             context: BrowserContext = await pw.chromium.launch_persistent_context(
                 user_data_dir=str(profile_dir),
                 headless=False,
+                executable_path=(str(Path(args.browser_executable).expanduser()) if args.browser_executable else None),
                 viewport={"width": 1440, "height": 1000},
                 locale="it-IT",
                 timezone_id="Europe/Rome",
@@ -1163,28 +1243,19 @@ async def main() -> int:
             await page.goto(
                 args.url,
                 wait_until="domcontentloaded",
-                timeout=120_000,
+                timeout=browser_timeout_ms,
             )
 
             print("[2/6] Attesa sessione autenticata e caricamento...")
             await wait_for_auth_and_page(
                 page,
-                timeout_ms=args.timeout_minutes * 60 * 1000,
+                timeout_ms=browser_timeout_ms,
             )
 
-            print("[2.5/6] Apro/riapro il pannello trascrizione per forzare la richiesta API...")
-            try:
-                btn = page.locator('button[aria-label*="rascriz"], button[aria-label*="ranscript"]').first
-                if await btn.is_visible(timeout=5000):
-                    # Se già aperto, chiudo e riapro per rilanciare la richiesta API
-                    is_list_visible = await page.locator("[aria-posinset]").first.is_visible(timeout=2000)
-                    if is_list_visible:
-                        await btn.click()           # chiude
-                        await page.wait_for_timeout(800)
-                    await btn.click()               # apre (e scatena la richiesta API)
-                    await page.wait_for_timeout(2000)
-            except Exception:
-                pass
+            print("[2.5/6] Apro il pannello Trascrizione...")
+            panel_open = await open_transcript_panel(page)
+            if panel_open:
+                await page.wait_for_timeout(2000)
 
             # Aspetta la risposta di rete (max 15s)
             try:
